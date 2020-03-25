@@ -21,3 +21,6 @@ work/
 out/
 tmp/
 reports/
+
+### MacOS stuff
+.DS_Store

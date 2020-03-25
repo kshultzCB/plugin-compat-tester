@@ -690,7 +690,6 @@ public class PluginCompatTester {
         if (!top.has("core")) {
             throw new IOException("no jenkins-core.jar in " + war);
         }
-        System.out.println("Scanned contents of " + war + ": " + top);
         return newUpdateSiteData(new UpdateSite(DEFAULT_SOURCE_ID, null), top);
     }
 
