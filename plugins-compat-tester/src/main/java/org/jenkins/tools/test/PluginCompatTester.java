@@ -25,16 +25,19 @@
  */
 package org.jenkins.tools.test;
 
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import hudson.AbortException;
 import hudson.Functions;
+import hudson.model.UpdateCenter;
 import hudson.model.UpdateSite;
 import hudson.model.UpdateSite.Plugin;
 import hudson.util.VersionNumber;
 import io.jenkins.lib.versionnumber.JavaSpecificationVersion;
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -46,6 +49,7 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +77,10 @@ import javax.xml.transform.stream.StreamSource;
 import net.sf.json.JSONArray;
 import net.sf.json.JSONObject;
 import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang.StringUtils;
+import org.apache.maven.model.Dependency;
+import org.apache.maven.model.Model;
+import org.apache.maven.model.Parent;
 import org.apache.maven.scm.ScmException;
 import org.apache.maven.scm.ScmFileSet;
 import org.apache.maven.scm.ScmTag;
@@ -83,9 +91,12 @@ import org.codehaus.plexus.PlexusContainerException;
 import org.codehaus.plexus.component.repository.exception.ComponentLookupException;
 import org.codehaus.plexus.util.FileUtils;
 import org.codehaus.plexus.util.io.RawInputStreamFacade;
+import org.codehaus.plexus.util.xml.pull.XmlPullParserException;
 import org.jenkins.tools.test.exception.PluginSourcesUnavailableException;
 import org.jenkins.tools.test.exception.PomExecutionException;
+import org.jenkins.tools.test.exception.ExecutedTestNamesSolverException;
 import org.jenkins.tools.test.maven.ExternalMavenRunner;
+import org.jenkins.tools.test.model.MavenBom;
 import org.jenkins.tools.test.maven.MavenRunner;
 import org.jenkins.tools.test.model.MavenCoordinates;
 import org.jenkins.tools.test.model.MavenPom;
@@ -100,6 +111,7 @@ import org.jenkins.tools.test.model.TestExecutionResult;
 import org.jenkins.tools.test.model.TestStatus;
 import org.jenkins.tools.test.model.hook.PluginCompatTesterHookBeforeCompile;
 import org.jenkins.tools.test.model.hook.PluginCompatTesterHooks;
+import org.jenkins.tools.test.util.ExecutedTestNamesSolver;
 import org.springframework.core.io.ClassPathResource;
 
 /**
@@ -116,15 +128,15 @@ public class PluginCompatTester {
     public static final String JENKINS_CORE_FILE_REGEX = "WEB-INF/lib/jenkins-core-([0-9.]+(?:-[0-9a-f.]+)*(?:-(?i)([a-z]+)(-)?([0-9a-f.]+)?)?(?:-(?i)([a-z]+)(-)?([0-9a-f.]+)?)?(?:-SNAPSHOT)?)[.]jar";
 
     private PluginCompatTesterConfig config;
-    private final MavenRunner runner;
+    private final ExternalMavenRunner runner;
 
     private List<String> splits;
     private Set<String> splitCycles;
 
-	public PluginCompatTester(PluginCompatTesterConfig config){
+    public PluginCompatTester(PluginCompatTesterConfig config){
         this.config = config;
         runner = new ExternalMavenRunner(config.getExternalMaven());
-	}
+    }
 
     private SortedSet<MavenCoordinates> generateCoreCoordinatesToTest(UpdateSite.Data data, PluginCompatReport previousReport){
         SortedSet<MavenCoordinates> coreCoordinatesToTest;
@@ -152,7 +164,7 @@ public class PluginCompatTester {
     }
 
 	public PluginCompatReport testPlugins()
-        throws PlexusContainerException, IOException {
+            throws PlexusContainerException, IOException, PomExecutionException, XmlPullParserException {
         File war = config.getWar();
         if (war != null) {
             populateSplits(war);
@@ -176,31 +188,32 @@ public class PluginCompatTester {
 
         // Scan bundled plugins
         // If there is any bundled plugin, only these plugins will be taken under the consideration for the PCT run
-        UpdateSite.Data data = config.getWar() == null ? extractUpdateCenterData(pluginGroupIds) : scanWAR(config.getWar(), pluginGroupIds, "WEB-INF/(?:optional-)?plugins/([^/.]+)[.][hj]pi");
+        UpdateSite.Data data = null;
+        if (config.getBom() != null) {
+            data = scanBom(pluginGroupIds, "([^/.]+)[.][hj]pi");
+        } else {
+            data = config.getWar() == null ? extractUpdateCenterData(pluginGroupIds) : scanWAR(config.getWar(), pluginGroupIds, "WEB-INF/(?:optional-)?plugins/([^/.]+)[.][hj]pi");
+        }
         if (!data.plugins.isEmpty()) {
             // Scan detached plugins to recover proper Group IDs for them
-            // We always poll the update center so that we extract groupIDs for dependencies
-            // In the case of Group ID renaming across version, groupID from the WAR file will have a priority
-            UpdateSite.Data detachedData = extractUpdateCenterData(pluginGroupIds);
-            if (config.getWar() != null) {
-                detachedData = scanWAR(config.getWar(), pluginGroupIds, "WEB-INF/(?:detached-)?plugins/([^/.]+)[.][hj]pi");
-            }
-
+            // At the moment, we are considering that bomfile contains the info about the detached ones
+            UpdateSite.Data detachedData = config.getBom() != null ? null : config.getWar() != null ? scanWAR(config.getWar(), pluginGroupIds, "WEB-INF/(?:detached-)?plugins/([^/.]+)[.][hj]pi") : extractUpdateCenterData(pluginGroupIds);  
 
             // Add detached if and only if no added as normal one
-            detachedData.plugins.forEach((key, value) -> {
-                if (!data.plugins.containsKey(key)) {
-                    data.plugins.put(key, value);
-                }
-            });
+            UpdateSite.Data finalData = data;
+            if (detachedData != null) {
+                detachedData.plugins.forEach((key, value) -> {
+                    if (!finalData.plugins.containsKey(key)) {
+                        finalData.plugins.put(key, value);
+                    }
+                });
+            }
         }
 
         final Map<String, Plugin> pluginsToCheck;
         final List<String> pluginsToInclude = config.getIncludePlugins();
         if (data.plugins.isEmpty() && pluginsToInclude != null && !pluginsToInclude.isEmpty()) {
             // Update Center returns empty info OR the "-war" option is specified for WAR without bundled plugins
-            // TODO: Ideally we should do this tweak in any case, so that we can test custom plugins with Jenkins cores before unbundling
-            // But it will require us to always poll the update center...
             System.out.println("WAR file does not contain plugin info, will try to extract it from UC for included plugins");
             pluginsToCheck = new HashMap<>(pluginsToInclude.size());
             UpdateSite.Data ucData = extractUpdateCenterData(pluginGroupIds);
@@ -231,7 +244,7 @@ public class PluginCompatTester {
         report.setTestJavaVersion(config.getTestJavaVersion());
 
         boolean failed = false;
-		SCMManagerFactory.getInstance().start();
+        SCMManagerFactory.getInstance().start();
         ROOT_CYCLE: for(MavenCoordinates coreCoordinates : testedCores){
             System.out.println("Starting plugin tests on core coordinates : "+coreCoordinates.toString());
             for (Plugin plugin : pluginsToCheck.values()) {
@@ -295,12 +308,14 @@ public class PluginCompatTester {
                     }
 
                     List<String> warningMessages = new ArrayList<>();
+                    Set<String> testDetails = new TreeSet<>();
                     if (errorMessage == null) {
                     try {
                         TestExecutionResult result = testPluginAgainst(actualCoreCoordinates, plugin, mconfig, pomData, pluginsToCheck, pluginGroupIds, pcth, config.getOverridenPlugins());
                         // If no PomExecutionException, everything went well...
                         status = TestStatus.SUCCESS;
                         warningMessages.addAll(result.pomWarningMessages);
+                        testDetails.addAll(config.isStoreAll() ? result.getTestDetails().getAll() : result.getTestDetails().getFailed());
                     } catch (PomExecutionException e) {
                         if(!e.succeededPluginArtifactIds.contains("maven-compiler-plugin")){
                             status = TestStatus.COMPILATION_ERROR;
@@ -311,6 +326,7 @@ public class PluginCompatTester {
                         }
                         errorMessage = e.getErrorMessage();
                         warningMessages.addAll(e.getPomWarningMessages());
+                        testDetails.addAll(config.isStoreAll() ? e.getTestDetails().getAll() : e.getTestDetails().getFailed());
                     } catch (Error e){
                         // Rethrow the error ... something is wrong !
                         throw e;
@@ -328,7 +344,12 @@ public class PluginCompatTester {
                     if(buildLogFile.exists()){
                         buildLogFilePath = createBuildLogFilePathFor(pluginInfos.pluginName, pluginInfos.pluginVersion, actualCoreCoordinates);
                     }
-                    PluginCompatResult result = new PluginCompatResult(actualCoreCoordinates, status, errorMessage, warningMessages, buildLogFilePath);
+
+                    if(config.getBom() != null) {
+                    	actualCoreCoordinates = new MavenCoordinates(actualCoreCoordinates.groupId, actualCoreCoordinates.artifactId, solveVersionFromModel(new MavenBom(config.getBom()).getModel()));
+                    }
+                    
+                    PluginCompatResult result = new PluginCompatResult(actualCoreCoordinates, status, errorMessage, warningMessages, testDetails, buildLogFilePath);
                     report.add(pluginInfos, result);
 
                     if(config.reportFile != null){
@@ -358,13 +379,13 @@ public class PluginCompatTester {
         }
 
         if (failed && config.isFailOnError()) {
-		    throw new AbortException("Execution was aborted due to the failure in a plugin test (-failOnError is set)");
+            throw new AbortException("Execution was aborted due to the failure in a plugin test (-failOnError is set)");
         }
 
         return report;
-	}
+    }
 
-    private void generateHtmlReportFile() throws IOException {
+    protected void generateHtmlReportFile() throws IOException {
         if (!config.reportFile.exists() || !config.reportFile.isFile()) {
             throw new FileNotFoundException("Cannot find the XML report file: " + config.reportFile);
         }
@@ -411,7 +432,7 @@ public class PluginCompatTester {
 
         File pluginCheckoutDir = new File(config.workDirectory.getAbsolutePath() + File.separator + plugin.name + File.separator);
 
-		try {
+        try {
             // Run any precheckout hooks
             Map<String, Object> beforeCheckout = new HashMap<>();
             beforeCheckout.put("pluginName", plugin.name);
@@ -463,13 +484,13 @@ public class PluginCompatTester {
                 }
                 System.out.println("The plugin has already been checked out, likely due to a multimodule situation. Continue.");
             }
-		} catch (ComponentLookupException e) {
-			System.err.println("Error : " + e.getMessage());
-			throw new PluginSourcesUnavailableException("Problem while creating ScmManager !", e);
-		} catch (Exception e) {
-			System.err.println("Error : " + e.getMessage());
-			throw new PluginSourcesUnavailableException("Problem while checking out plugin sources!", e);
-		}
+        } catch (ComponentLookupException e) {
+            System.err.println("Error : " + e.getMessage());
+            throw new PluginSourcesUnavailableException("Problem while creating ScmManager !", e);
+        } catch (Exception e) {
+            System.err.println("Error : " + e.getMessage());
+            throw new PluginSourcesUnavailableException("Problem while checking out plugin sources!", e);
+        }
 
         File buildLogFile = createBuildLogFile(config.reportFile, plugin.name, plugin.version, coreCoordinates);
         FileUtils.forceMkdir(buildLogFile.getParentFile()); // Creating log directory
@@ -531,18 +552,19 @@ public class PluginCompatTester {
 
             // Execute with tests
             runner.run(mconfig, pluginCheckoutDir, buildLogFile, args.toArray(new String[args.size()]));
-
-            return new TestExecutionResult(((PomData)forExecutionHooks.get("pomData")).getWarningMessages());
-        }catch(PomExecutionException e){
-            PomExecutionException e2 = new PomExecutionException(e);
-            e2.getPomWarningMessages().addAll(pomData.getWarningMessages());
+            // TODO extract tests names by filter
+            return new TestExecutionResult(((PomData)forExecutionHooks.get("pomData")).getWarningMessages(), new ExecutedTestNamesSolver().solve(runner.getExecutedTests(), pluginCheckoutDir));
+        } catch (ExecutedTestNamesSolverException e) {
+            throw new PomExecutionException(e);
+        } catch (PomExecutionException e){
+            e.getPomWarningMessages().addAll(pomData.getWarningMessages());
             if (ranCompile) {
                 // So the status is considered to be TEST_FAILURES not COMPILATION_ERROR:
-                e2.succeededPluginArtifactIds.add("maven-compiler-plugin");
+                e.succeededPluginArtifactIds.add("maven-compiler-plugin");
             }
-            throw e2;
+            throw e;
         }
-	}
+    }
 
     protected void cloneFromSCM(PomData pomData, String name, String version, File checkoutDirectory) throws ComponentLookupException, ScmException, IOException {
         String scmTag;
@@ -595,14 +617,14 @@ public class PluginCompatTester {
      * @return Update site Data
      */
     private UpdateSite.Data extractUpdateCenterData(Map<String, String> groupIDs){
-		URL url;
-		String jsonp;
-		try {
-	        url = new URL(config.updateCenterUrl);
-	        jsonp = IOUtils.toString(url.openStream());
-		}catch(IOException e){
-			throw new RuntimeException("Invalid update center url : "+config.updateCenterUrl, e);
-		}
+        URL url;
+        String jsonp;
+        try {
+            url = new URL(config.updateCenterUrl);
+            jsonp = IOUtils.toString(url.openStream());
+        }catch(IOException e){
+            throw new RuntimeException("Invalid update center url : "+config.updateCenterUrl, e);
+        }
 
         String json = jsonp.substring(jsonp.indexOf('(')+1,jsonp.lastIndexOf(')'));
         UpdateSite us = new UpdateSite(DEFAULT_SOURCE_ID, url.toExternalForm());
@@ -618,7 +640,138 @@ public class PluginCompatTester {
         }
 
         return site;
+    }
+
+    private UpdateSite.Data scanBom(HashMap<String, String> pluginGroupIds, String pluginRegExp) throws IOException, PomExecutionException, XmlPullParserException {
+    	
+    	JSONObject top = new JSONObject();
+    	top.put("id", DEFAULT_SOURCE_ID);
+    	JSONObject plugins = new JSONObject();
+    	
+    	for (File entry : getBomEntries()) {
+    		String name = entry.getName();
+    		Matcher m = Pattern.compile(pluginRegExp).matcher(name);
+    		try (InputStream is = new FileInputStream(entry); JarInputStream jis = new JarInputStream(is)) {
+    		    Manifest manifest = jis.getManifest();
+    		    if (manifest == null || manifest.getMainAttributes() == null) {
+    		        // Skip this entry, is not a plugin and/or contains a malformed manifest so is not parseable
+    		        System.out.println("Entry " + name + "defined in the BOM looks non parseable, ignoring");
+    		        continue;
+    		    }
+    		    String jenkinsVersion = manifest.getMainAttributes().getValue("Jenkins-Version");
+    		    String shortName = manifest.getMainAttributes().getValue("Short-Name");
+    		    String groupId = manifest.getMainAttributes().getValue("Group-Id");
+    		    String version = manifest.getMainAttributes().getValue("Plugin-Version");
+    		    String dependencies = manifest.getMainAttributes().getValue("Plugin-Dependencies");
+    		    // I expect BOMs to not specify hpi as type, which results in getting the jar artifact
+    		    if (m.matches() || (jenkinsVersion != null && version != null)) { // I need a plugin version
+    		        JSONObject plugin = new JSONObject().accumulate("url", "");
+    		        if (shortName == null) {
+    		            shortName = manifest.getMainAttributes().getValue("Extension-Name");
+    		            if (shortName == null) {
+    		                shortName = m.group(1);
+    		            }
+    		        }
+
+    		        // If hpi is registered, avoid to override it by its jar entry
+    		        if(plugins.containsKey(shortName) && entry.getPath().endsWith(".jar")) {
+    		            continue;
+    		        }
+
+    		        plugin.put("name", shortName);
+    		        pluginGroupIds.put(shortName, groupId);
+    		        // Remove extra build information from the version number
+    		        final Matcher matcher = Pattern.compile("^(.+-SNAPSHOT)(.+)$").matcher(version);
+    		        if (matcher.matches()) {
+    		            version = matcher.group(1);
+    		        }
+    		        plugin.put("version", version);
+    		        plugin.put("url", "jar:" + entry.toURI().getPath() + "!/name.hpi");
+    		        JSONArray dependenciesA = new JSONArray();
+    		        if (dependencies != null) {
+    		            // e.g. matrix-auth:1.0.2;resolution:=optional,credentials:1.8.3;resolution:=optional
+    		            for (String pair : dependencies.split(",")) {
+    		                boolean optional = pair.endsWith("resolution:=optional");
+    		                String[] nameVer = pair.replace(";resolution:=optional", "").split(":");
+    		                assert nameVer.length == 2;
+    		                dependenciesA.add(new JSONObject().accumulate("name", nameVer[0]).accumulate("version", nameVer[1]).accumulate("optional", String.valueOf(optional)));
+    		            }
+    		        }
+    		        plugin.accumulate("dependencies", dependenciesA);
+    		        plugins.put(shortName, plugin);
+    		    }
+    		}
+    	}
+
+    	top.put("plugins", plugins);
+    	if (!top.has("core")) {
+    		// Not all boms have the jenkins core dependency explicit, so, assume the bom version matches the jenkins version
+    		String core = solveCoreVersionFromBom();
+    		if (StringUtils.isEmpty(core)) {
+    			throw new IllegalStateException("Unable to retrieve any version for the core");
+    		}
+    		top.put("core", new JSONObject().accumulate("name", "core").accumulate("version",core).accumulate("url", "https://foobar"));
+    	}
+    	System.out.println("Readed contents of " + config.getBom() + ": " + top);
+    	return newUpdateSiteData(new UpdateSite(DEFAULT_SOURCE_ID, null), top);
+    }
+
+    private List<File> getBomEntries() throws IOException, XmlPullParserException, PomExecutionException {
+        File fullDepPom = new MavenBom(config.getBom()).writeFullDepPom(config.workDirectory);
+
+    	MavenRunner.Config mconfig = new MavenRunner.Config();
+    	mconfig.userSettingsFile = config.getM2SettingsFile();
+    	System.out.println(mconfig.userSettingsFile);
+    	// TODO REMOVE
+    	mconfig.userProperties.putAll(this.config.retrieveMavenProperties());
+
+    	File buildLogFile = new File(config.workDirectory
+    			+ File.separator + "bom-download.log");
+    	FileUtils.fileWrite(buildLogFile.getAbsolutePath(), ""); // Creating log file
+
+    	runner.run(mconfig, fullDepPom.getParentFile(), buildLogFile, "dependency:copy-dependencies", "-P consume-incrementals", "-N");
+    	return FileUtils.getFiles(new File(config.workDirectory, "bom" + File.separator + "target" + File.separator + "dependency"),null, null);
+    }
+
+    /**
+     * @return Provides the core version from the bomfile and in case it is not found, the bom version, if bom version does not exist, it provides from its parent
+     * @throws IOException
+     * @throws XmlPullParserException
+     */
+    private String solveCoreVersionFromBom() throws IOException, XmlPullParserException {
+    	Model model = new MavenBom(config.getBom()).getModel();
+    	for (Dependency dependency : model.getDependencies()) {
+		if(dependency.getArtifactId().equals("jenkins-core")) {
+			return getProperty(model, dependency.getVersion());
+		}
 	}
+    	return solveVersionFromModel(model);
+    }
+
+    private String solveVersionFromModel(Model model) {
+	String version = model.getVersion();
+	Parent parent = model.getParent();
+	return version != null ? version : parent != null ? parent.getVersion() : StringUtils.EMPTY;
+    }
+    
+    /**
+     * Given a value and a model, it checks if it is an interpolated value. In negative case it returns the same 
+     * value. In affirmative case, it retrieves its value from the properties of the Maven model.
+     * @param model
+     * @param version
+     * @return the effective value of an specific value in a model
+     */
+    private String getProperty(Model model, String value) {
+    	if (!value.contains("$")) {
+    		return value;
+    	}
+    	
+    	String key = value.replaceAll("\\$", "")
+    			.replaceAll("\\{", "")
+    			.replaceAll("\\}", "");
+    	
+    	return getProperty(model, model.getProperties().getProperty(key));
+    }
 
     /**
      * Scans through a WAR file, accumulating plugin information
@@ -718,10 +871,11 @@ public class PluginCompatTester {
             runner.run(mconfig, pluginCheckoutDir, tmp, "dependency:resolve");
             try (BufferedReader br =
                     Files.newBufferedReader(tmp.toPath(), Charset.defaultCharset())) {
-                Pattern p = Pattern.compile("\\[INFO\\]    ([^:]+):([^:]+):([a-z-]+):(([^:]+):)?([^:]+):(provided|compile|runtime|system)");
-                Pattern p2 = Pattern.compile("\\[INFO\\]    ([^:]+):([^:]+):([a-z-]+):(([^:]+):)?([^:]+):(test)");
+                Pattern p = Pattern.compile("\\[INFO\\]([^:]+):([^:]+):([a-z-]+):(([^:]+):)?([^:]+):(provided|compile|runtime|system)(\\(optional\\))?");
+                Pattern p2 = Pattern.compile("\\[INFO\\]([^:]+):([^:]+):([a-z-]+):(([^:]+):)?([^:]+):(test)");
                 String line;
                 while ((line = br.readLine()) != null) {
+                    line = line.replace(" ", "");
                     Matcher m = p.matcher(line);
                     Matcher m2 = p2.matcher(line);
                     String groupId;
@@ -784,6 +938,15 @@ public class PluginCompatTester {
             overridenPlugins.forEach(plugin -> {
                 toReplace.put(plugin.getName(), plugin.getVersion());
                 toReplaceTest.put(plugin.getName(), plugin.getVersion());
+                if (plugin.getGroupId() != null) {
+                    if (pluginGroupIds.containsKey(plugin.getName())) {
+                        if (!plugin.getGroupId().equals(pluginGroupIds.get(plugin.getName()))) {
+                            System.err.println("WARNING: mismatch between detected and explicit group ID for " + plugin.getName());
+                        }
+                    } else {
+                        pluginGroupIds.put(plugin.getName(), plugin.getGroupId());
+                    }
+                }
             });
 
             for (String split : splits) {
@@ -829,7 +992,7 @@ public class PluginCompatTester {
                 pom.addDependencies(toAdd, toReplace, toAddTest, toReplaceTest, coreDep, pluginGroupIds, convertFromTestDep);
             }
 
-	    // TODO(oleg_nenashev): This is a hack, logic above should be refactored somehow (JENKINS-55279)
+        // TODO(oleg_nenashev): This is a hack, logic above should be refactored somehow (JENKINS-55279)
             // Remove the self-dependency if any
             pom.removeDependency(pluginGroupIds.get(thisPlugin), thisPlugin);
         }
